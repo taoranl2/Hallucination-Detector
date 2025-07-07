@@ -17,7 +17,10 @@ from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 import seaborn as sns
 from unified_hallucination_detector import UnifiedHallucinationDetector, HallucinationSample
+from tqdm import tqdm  # Add tqdm import
 import warnings
+import os
+import hashlib
 warnings.filterwarnings('ignore')
 
 
@@ -40,9 +43,10 @@ class ModelInterface:
                 torch_dtype=torch.float16,
                 device_map="auto"
             )
-            
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
+            # Set the model's pad_token_id to match the tokenizer to avoid warnings
+            self.model.config.pad_token_id = self.tokenizer.pad_token_id
         else:
             print("Running in black-box mode (API simulation)")
             self.tokenizer = None
@@ -61,7 +65,8 @@ class ModelInterface:
                     temperature=temperature,
                     do_sample=temperature > 0,
                     return_dict_in_generate=True,
-                    output_scores=True
+                    output_scores=True,
+                    pad_token_id=self.tokenizer.pad_token_id
                 )
                 
             response = self.tokenizer.decode(outputs.sequences[0], skip_special_tokens=True)
@@ -122,55 +127,6 @@ def load_dataset(filepath: str) -> List[HallucinationSample]:
         
     return samples
 
-
-def create_synthetic_dataset(n_samples: int = 1000, 
-                           labeled_ratio: float = 0.2) -> List[HallucinationSample]:
-    """Create synthetic dataset for testing"""
-    np.random.seed(42)
-    
-    # Templates and entities
-    templates = [
-        ("What is the capital of {}?", ["France", "Germany", "Japan", "Mars", "Atlantis"]),
-        ("Who wrote {}?", ["1984", "Harry Potter", "The Bible", "The Internet", "Python"]),
-        ("When was {} invented?", ["the wheel", "electricity", "time travel", "unicorns"]),
-        ("What is the formula for {}?", ["water", "gold", "happiness", "dark matter"]),
-        ("Who discovered {}?", ["America", "gravity", "fire", "the meaning of life"])
-    ]
-    
-    samples = []
-    
-    for i in range(n_samples):
-        template, entities = templates[i % len(templates)]
-        entity = np.random.choice(entities)
-        query = template.format(entity)
-        
-        # Generate response and label
-        if "Mars" in entity or "Atlantis" in entity or "time travel" in entity or \
-           "unicorns" in entity or "happiness" in entity or "dark matter" in entity or \
-           "meaning of life" in entity:
-            # Hallucinated
-            response = f"The answer is definitely {entity} which everyone knows"
-            true_label = 1
-        else:
-            # Factual
-            response = f"The answer is related to {entity} based on factual information"
-            true_label = 0
-            
-        # Assign label based on ratio
-        if i < int(n_samples * labeled_ratio):
-            label = true_label
-        else:
-            label = None  # Unlabeled
-            
-        samples.append(HallucinationSample(
-            query=query,
-            response=response,
-            label=label
-        ))
-        
-    return samples
-
-
 def evaluate_detector(detector: UnifiedHallucinationDetector,
                      test_samples: List[HallucinationSample],
                      save_prefix: str = "results") -> Dict:
@@ -180,9 +136,9 @@ def evaluate_detector(detector: UnifiedHallucinationDetector,
     confidences = []
     all_scores = []
     true_labels = []
-    
-    print("Evaluating on test set...")
-    for i, sample in enumerate(test_samples):
+
+    # Use tqdm for progress bar instead of print statements
+    for sample in tqdm(test_samples, desc="Evaluating"):
         if sample.label is None:
             continue
             
@@ -191,9 +147,6 @@ def evaluate_detector(detector: UnifiedHallucinationDetector,
         confidences.append(conf)
         all_scores.append(scores)
         true_labels.append(sample.label)
-        
-        if i % 50 == 0:
-            print(f"Processed {i}/{len(test_samples)} samples")
     
     # Calculate metrics
     report = classification_report(true_labels, predictions, output_dict=True)
@@ -245,19 +198,19 @@ def evaluate_detector(detector: UnifiedHallucinationDetector,
                 'index': i,
                 'query': test_samples[i].query,
                 'response': test_samples[i].response,
-                'predicted': pred,
-                'true': true,
-                'confidence': confidences[i],
-                'scores': all_scores[i]
+                'predicted': int(pred),  # Convert to int
+                'true': int(true),  # Convert to int
+                'confidence': float(confidences[i]),  # Convert to float
+                'scores': {k: float(v) for k, v in all_scores[i].items()}  # Convert all scores to float
             })
     
-    # Save detailed results
+    # Save detailed results - ensure all numpy types are converted
     results = {
         'classification_report': report,
-        'auc_roc': auc,
-        'confusion_matrix': cm.tolist(),
+        'auc_roc': float(auc),  # Convert to float
+        'confusion_matrix': cm.astype(int).tolist(),  # Convert to int then list
         'num_errors': len(errors),
-        'error_rate': len(errors) / len(true_labels),
+        'error_rate': float(len(errors) / len(true_labels)),  # Convert to float
         'top_errors': errors[:10]  # Save top 10 errors
     }
     
@@ -328,11 +281,39 @@ def ablation_study(samples: List[HallucinationSample],
     
     return results
 
+def generate_model_filename(data_path: str, white_box: bool, model_name: str, 
+                          n_samples: int = 2, n_epochs: int = 5, number_of_samples: int = None) -> str:
+    """Generate a unique filename for the trained model based on parameters"""
+    # Extract dataset name
+    dataset_name = os.path.splitext(os.path.basename(data_path))[0]
+    
+    # Sanitize model name for filename
+    model_name_clean = model_name.replace('/', '_').replace('-', '_')
+    
+    # Create parameter string
+    if number_of_samples is not None:   
+        params = f"{dataset_name}_wb{white_box}_model{model_name_clean}_ns{n_samples}_ep{n_epochs}_n{number_of_samples}"
+    else:
+        params = f"{dataset_name}_wb{white_box}_model{model_name_clean}_ns{n_samples}_ep{n_epochs}_all"
+    
+    # Create models directory if it doesn't exist
+    os.makedirs("saved_models", exist_ok=True)
+    
+    return f"saved_models/{params}.pkl"
 
-def run_full_experiment(data_path: Optional[str] = None,
+def run_full_experiment(data_path: str,
                        white_box: bool = True,
-                       model_name: str = "meta-llama/Llama-2-7b-hf"):
-    """Run complete experimental pipeline"""
+                       model_name: str = "meta-llama/Llama-2-7b-hf",
+                       force_retrain: bool = False,
+                       number_of_samples: int = None):
+    """Run complete experimental pipeline
+    
+    Args:
+        data_path: Path to JSON dataset file (required)
+        white_box: Whether to use white-box mode with TSV
+        model_name: Name of the model to use
+        force_retrain: Force retraining even if saved model exists
+    """
     
     if white_box:
         print("=" * 70)
@@ -349,13 +330,11 @@ def run_full_experiment(data_path: Optional[str] = None,
     # Initialize model interface
     model_interface = ModelInterface(model_name=model_name, white_box=white_box)
     
-    # Load or create dataset
-    if data_path:
-        samples = load_dataset(data_path)
-    else:
-        print("Creating synthetic dataset...")
-        samples = create_synthetic_dataset(n_samples=1000, labeled_ratio=0.2)
-    
+    # Load dataset (required parameter now)
+    print(f"\nLoading dataset from: {data_path}")
+    samples = load_dataset(data_path)
+    if number_of_samples is not None:
+        samples = samples[:number_of_samples]
     # Split data
     labeled_samples = [s for s in samples if s.label is not None]
     train_samples, test_samples = train_test_split(
@@ -371,58 +350,84 @@ def run_full_experiment(data_path: Optional[str] = None,
     print(f"Test samples: {len(test_samples)}")
     print(f"Unlabeled samples: {len(unlabeled_samples)}")
     
-    # Initialize unified detector
-    detector = UnifiedHallucinationDetector(
-        model_fn=model_interface.generate_with_logprobs,
-        use_tsv=white_box,  # Only use TSV in white-box mode
-        hidden_dim=4096 if "llama" in model_name.lower() else 4096
+    # Generate model filename
+    model_filename = generate_model_filename(
+        data_path=data_path,
+        white_box=white_box,
+        model_name=model_name,
+        n_samples=5,  # Match the n_samples in UnifiedHallucinationDetector
+        n_epochs=5,    # Match the epochs in train method
+        number_of_samples=number_of_samples
     )
     
-    # Train
-    print("\nTraining unified detector...")
-    all_train_samples = train_samples + unlabeled_samples
-    detector.train(all_train_samples)
+    # Check if model exists and load if not forcing retrain
+    if os.path.exists(model_filename) and not force_retrain:
+        print(f"\nFound existing model: {model_filename}")
+        print("Loading trained model...")
+        detector = UnifiedHallucinationDetector.load(
+            model_filename, 
+            model_fn=model_interface.generate_with_logprobs
+        )
+    else:
+        # Initialize unified detector
+        print("\nNo existing model found or force_retrain=True")
+        print("Training new model...")
+        detector = UnifiedHallucinationDetector(
+            model_fn=model_interface.generate_with_logprobs,
+            use_tsv=white_box,  # Only use TSV in white-box mode
+            hidden_dim=4096 if "llama" in model_name.lower() else 4096
+        )
+        
+        # Train
+        print("\nTraining unified detector...")
+        all_train_samples = train_samples + unlabeled_samples
+        detector.train(all_train_samples)
+        
+        # Save the trained model
+        detector.save(model_filename)
     
     # Evaluate
     print("\nEvaluating on test set...")
     eval_results = evaluate_detector(detector, test_samples)
     
-    # Ablation study
-    if white_box:
-        print("\nPerforming ablation study...")
-        ablation_results = ablation_study(samples, model_interface)
+    # # Ablation study
+    # if white_box and force_retrain:  # Only do ablation when training new model
+    #     print("\nPerforming ablation study...")
+    #     ablation_results = ablation_study(samples, model_interface)
     
-    # Interactive testing
-    print("\n=== Interactive Testing ===")
-    print("Enter 'quit' to exit")
+    # # Interactive testing
+    # print("\n=== Interactive Testing ===")
+    # print("Enter 'quit' to exit")
     
-    while True:
-        query = input("\nEnter query: ")
-        if query.lower() == 'quit':
-            break
+    # while True:
+    #     query = input("\nEnter query: ")
+    #     if query.lower() == 'quit':
+    #         break
             
-        response = input("Enter response: ")
+    #     response = input("Enter response: ")
         
-        prediction, confidence, scores = detector.predict(query, response)
+    #     prediction, confidence, scores = detector.predict(query, response)
         
-        print(f"\nPrediction: {'HALLUCINATED' if prediction == 1 else 'FACTUAL'}")
-        print(f"Confidence: {confidence:.3f}")
-        print("\nComponent Scores:")
-        for name, value in scores.items():
-            print(f"  {name}: {value:.3f}")
+    #     print(f"\nPrediction: {'HALLUCINATED' if prediction == 1 else 'FACTUAL'}")
+    #     print(f"Confidence: {confidence:.3f}")
+    #     print("\nComponent Scores:")
+    #     for name, value in scores.items():
+    #         print(f"  {name}: {value:.3f}")
 
 
 if __name__ == "__main__":
-    # Example usage
-    # For synthetic data with black-box access (safer for testing):
-    print("Running in black-box mode first (no TSV, no model needed)...")
-    run_full_experiment(white_box=False)
-    
-    # For synthetic data with white-box access:
-    # run_full_experiment(white_box=True)
+    # For real data with white-box access:
+    run_full_experiment(
+        data_path="truthfulqa_hallucination_dataset.json", 
+        white_box=True, 
+        model_name="meta-llama/Meta-Llama-3-8B",
+        force_retrain=False,
+        number_of_samples=1000
+    )
     
     # For real data with black-box access:
-    # run_full_experiment(data_path="path/to/data.json", white_box=False)
-    
-    # For specific model:
-    # run_full_experiment(white_box=True, model_name="meta-llama/Llama-3-8b")
+    # run_full_experiment(
+    #     data_path="truthfulqa_hallucination_dataset.json", 
+    #     white_box=False,
+    #     model_name="meta-llama/Meta-Llama-3-8B"
+    # )

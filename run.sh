@@ -9,7 +9,5 @@ export CUDA_VISIBLE_DEVICES=0
 
 conda activate dp
 
-# python demo_script.py
-# python test_minimal.py
+# python generate_truthfulqa_dataset.py
 python unified_experiments.py
-

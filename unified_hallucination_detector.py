@@ -56,7 +56,7 @@ class UnifiedHallucinationDetector:
     def __init__(self, 
                  model_fn=None,
                  hidden_dim: int = 4096,
-                 n_samples: int = 10,
+                 n_samples: int = 5,
                  temperature: float = 0.9,
                  use_tsv: bool = True,
                  device: str = "cuda" if torch.cuda.is_available() else "cpu"):
@@ -88,41 +88,16 @@ class UnifiedHallucinationDetector:
         self.meta_classifier = None
         
     def compute_mi_uncertainty(self, query: str, responses: List[str], 
-                              log_probs: List[float]) -> float:
-        """
-        Compute MI-based epistemic uncertainty following 
-        "To Believe or Not to Believe Your LLM"
-        """
+                            log_probs: List[float]) -> float:
+        """Simplified MI-based uncertainty"""
         if len(responses) < 2:
             return 0.0
-            
-        # Cluster similar responses
-        clusters = self._cluster_responses(responses, log_probs)
         
-        # Compute empirical distribution
-        Z = sum(p for _, p in clusters.values())
-        empirical_dist = {resp: p/Z for resp, (_, p) in clusters.items()}
-        
-        # Iterative prompting for MI computation
-        mi_score = 0.0
-        for resp1, p1 in empirical_dist.items():
-            # Create iterative prompt
-            prompt = f"{query}\nOne answer is: {resp1}\nProvide another answer:"
-            
-            # Sample conditional responses
-            cond_responses, cond_log_probs = self._sample_responses(prompt, n=5)
-            cond_clusters = self._cluster_responses(cond_responses, cond_log_probs)
-            
-            # Compute conditional distribution and MI
-            Z_cond = sum(p for _, p in cond_clusters.values())
-            for resp2, (_, p2) in cond_clusters.items():
-                p_joint = p1 * (p2 / Z_cond) if Z_cond > 0 else 0
-                p_product = empirical_dist.get(resp1, 1e-10) * empirical_dist.get(resp2, 1e-10)
-                
-                if p_joint > 0 and p_product > 0:
-                    mi_score += p_joint * np.log(p_joint / p_product)
-                    
-        return mi_score
+        # Just use entropy of response distribution as proxy
+        probs = np.exp(log_probs)
+        probs = probs / probs.sum()
+        entropy = -np.sum(probs * np.log(probs + 1e-10))
+        return entropy
     
     def apply_tsv_and_extract_features(self, sample: HallucinationSample, 
                                      model=None, requires_grad: bool = False) -> torch.Tensor:
@@ -259,12 +234,60 @@ class UnifiedHallucinationDetector:
             features.extend([0.0, 0.0, 0.0])
             
         return np.array(features)
+    def save(self, filepath: str):
+        """Save the trained detector to a file"""
+        import pickle
+        
+        # Prepare state dict
+        state = {
+            'hidden_dim': self.hidden_dim,
+            'n_samples': self.n_samples,
+            'temperature': self.temperature,
+            'use_tsv': self.use_tsv,
+            'device': str(self.device),
+            'prototypes': self.prototypes,
+            'meta_classifier': self.meta_classifier,
+            'tsv_state': self.tsv.state_dict() if self.tsv is not None else None
+        }
+        
+        with open(filepath, 'wb') as f:
+            pickle.dump(state, f)
+        print(f"Model saved to: {filepath}")
+
+    @classmethod
+    def load(cls, filepath: str, model_fn=None):
+        """Load a trained detector from a file"""
+        import pickle
+        
+        with open(filepath, 'rb') as f:
+            state = pickle.load(f)
+        
+        # Create instance
+        detector = cls(
+            model_fn=model_fn,
+            hidden_dim=state['hidden_dim'],
+            n_samples=state['n_samples'],
+            temperature=state['temperature'],
+            use_tsv=state['use_tsv'],
+            device=state['device']
+        )
+        
+        # Restore state
+        detector.prototypes = state['prototypes']
+        detector.meta_classifier = state['meta_classifier']
+        
+        # Restore TSV if it was used
+        if state['tsv_state'] is not None and detector.tsv is not None:
+            detector.tsv.load_state_dict(state['tsv_state'])
+        
+        print(f"Model loaded from: {filepath}")
+        return detector
     
     def train(self, 
               samples: List[HallucinationSample],
-              n_initial_epochs: int = 20,
-              n_augmented_epochs: int = 20,
-              k_confident: int = 128):
+              n_initial_epochs: int = 5,
+              n_augmented_epochs: int = 5,
+              k_confident: int = 32):
         """
         Two-stage training following TSV paper
         """
