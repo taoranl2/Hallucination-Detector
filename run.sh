@@ -9,12 +9,12 @@ export CUDA_VISIBLE_DEVICES=0
 
 conda activate dp
 
-# python generate_truthfulqa_dataset.py
+# python generate_dataset.py -o large_dataset.json -n 3000
+
 python unified_experiments.py \
-    --data_path truthfulqa_hallucination_dataset.json \
+    --data_path large_dataset.json \
     --black_box \
-    --ensemble \
     --model_name meta-llama/Llama-3.1-8B-Instruct \
-    --num_samples 1500 \
+    --num_samples 500 \
     --force_retrain \
     --no_save

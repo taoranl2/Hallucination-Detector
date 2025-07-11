@@ -1,9 +1,3 @@
-# FILE: generate_multi_dataset.py
-"""
-Generate a test dataset using both TruthfulQA and TriviaQA for hallucination detection
-Creates a much larger and more diverse dataset
-"""
-
 import json
 import random
 import argparse
@@ -84,7 +78,7 @@ def create_triviaqa_samples(triviaqa_data, n_samples: Optional[int] = None,
                            labeled_ratio: float = 0.8, seed: int = 42,
                            hallucination_templates: List[str] = None) -> List[Dict]:
     """Create samples from TriviaQA"""
-    random.seed(seed + 1)  # Different seed to avoid correlation
+    random.seed(seed + 1)
     
     if hallucination_templates is None:
         hallucination_templates = [
@@ -98,7 +92,6 @@ def create_triviaqa_samples(triviaqa_data, n_samples: Optional[int] = None,
             "The widely accepted answer is {fake_answer}."
         ]
     
-    # Common wrong answers for different question types
     fake_answers = [
         "Paris", "London", "New York", "Tokyo", "Berlin", "Rome", "Madrid", "Amsterdam",
         "1969", "1945", "1776", "2001", "1989", "1492", "1865", "1914",
@@ -113,27 +106,44 @@ def create_triviaqa_samples(triviaqa_data, n_samples: Optional[int] = None,
     total_questions = len(triviaqa_data)
     
     if n_samples is None:
-        questions_to_use = min(total_questions, 2000)  # Limit TriviaQA to reasonable size
+        questions_to_use = min(total_questions, 2000)
     else:
-        questions_to_use = min(total_questions, n_samples // 2)  # Half from TriviaQA
+        questions_to_use = min(total_questions, n_samples // 2)
     
     print(f"Processing {questions_to_use} TriviaQA questions...")
     
-    for idx in tqdm(range(questions_to_use), desc="TriviaQA"):
+    processed = 0
+    skipped = 0
+    
+    for idx in tqdm(range(min(questions_to_use, total_questions)), desc="TriviaQA"):
+
         item = triviaqa_data[idx]
-        question = item['question'].strip()
         
-        # Get the answer (TriviaQA has multiple answer formats)
-        answer_dict = item['answer']
-        if 'value' in answer_dict:
-            correct_answer = answer_dict['value'].strip()
-        elif 'normalized_value' in answer_dict:
-            correct_answer = answer_dict['normalized_value'].strip()
-        else:
-            # Skip if no clear answer
+        if not isinstance(item, dict):
+            skipped += 1
             continue
             
+        question = item.get('question', '').strip()
+        if not question:
+            skipped += 1
+            continue
+        
+        # Get the answer
+        answer_dict = item.get('answer', {})
+        if not isinstance(answer_dict, dict):
+            skipped += 1
+            continue
+            
+        correct_answer = None
+        if 'value' in answer_dict:
+            correct_answer = str(answer_dict['value']).strip()
+        elif 'normalized_value' in answer_dict:
+            correct_answer = str(answer_dict['normalized_value']).strip()
+        elif 'aliases' in answer_dict and answer_dict['aliases']:
+            correct_answer = str(answer_dict['aliases'][0]).strip()
+        
         if not correct_answer or len(correct_answer) < 2:
+            skipped += 1
             continue
         
         # Create factual sample
@@ -150,12 +160,10 @@ def create_triviaqa_samples(triviaqa_data, n_samples: Optional[int] = None,
         samples.append(factual_sample)
         
         # Create hallucinated sample
-        # Choose a fake answer that's different from the correct one
         fake_answer = random.choice(fake_answers)
         while fake_answer.lower() in correct_answer.lower() or correct_answer.lower() in fake_answer.lower():
             fake_answer = random.choice(fake_answers)
         
-        # Use template to create hallucinated response
         template = random.choice(hallucination_templates)
         hallucinated_response = template.format(fake_answer=fake_answer)
         
@@ -171,6 +179,11 @@ def create_triviaqa_samples(triviaqa_data, n_samples: Optional[int] = None,
             }
         }
         samples.append(hallucinated_sample)
+        
+        processed += 1
+
+    if skipped > 0:
+        print(f"Skipped {skipped} TriviaQA items due to format issues")
     
     return samples
 
@@ -182,19 +195,39 @@ def create_cross_contamination_samples(truthfulqa_data, triviaqa_data,
     random.seed(seed + 2)
     
     samples = []
+
+    tqa_questions = []
+    for i, item in enumerate(truthfulqa_data):
+        if i >= 50:  # Limit to first 50
+            break
+        if isinstance(item, dict) and 'question' in item:
+            question = item['question'].strip()
+            if question:
+                tqa_questions.append(question)
     
-    # Get some TruthfulQA questions and TriviaQA answers
-    tqa_questions = [item['question'].strip() for item in truthfulqa_data[:50]]
+    # Get some TriviaQA answers
     trivia_answers = []
+    for i, item in enumerate(triviaqa_data):
+        if i >= 100:  # Limit to first 100
+            break
+        if isinstance(item, dict) and 'answer' in item:
+            answer_dict = item['answer']
+            if isinstance(answer_dict, dict):
+                if 'value' in answer_dict:
+                    answer = answer_dict['value'].strip()
+                elif 'normalized_value' in answer_dict:
+                    answer = answer_dict['normalized_value'].strip()
+                else:
+                    continue
+                
+                if answer and len(answer) > 2:
+                    trivia_answers.append(answer)
     
-    for item in triviaqa_data[:100]:
-        answer_dict = item['answer']
-        if 'value' in answer_dict:
-            answer = answer_dict['value'].strip()
-            if answer and len(answer) > 2:
-                trivia_answers.append(answer)
+    if not tqa_questions or not trivia_answers:
+        print("Warning: Could not extract questions/answers for cross-contamination")
+        return samples
     
-    print(f"Creating {n_samples} cross-contamination samples...")
+    print(f"Creating {min(n_samples, len(tqa_questions))} cross-contamination samples...")
     
     for i in range(min(n_samples, len(tqa_questions))):
         question = random.choice(tqa_questions)
@@ -221,6 +254,7 @@ def create_cross_contamination_samples(truthfulqa_data, triviaqa_data,
             }
         }
         samples.append(sample)
+    
     
     return samples
 
@@ -283,7 +317,7 @@ def save_dataset(samples: List[Dict], output_path: str, include_metadata: bool =
     print(f"\nEnhanced dataset saved to: {output_path}")
 
 
-def main():
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Generate enhanced dataset using TruthfulQA + TriviaQA for hallucination detection"
     )
@@ -335,6 +369,8 @@ def main():
     args = parser.parse_args()
     
     all_samples = []
+    truthfulqa = None
+    triviaqa = None
     
     # Load and process TruthfulQA
     if not args.triviaqa_only:
@@ -347,6 +383,7 @@ def main():
         )
         all_samples.extend(truthfulqa_samples)
         print(f"Added {len(truthfulqa_samples)} TruthfulQA samples")
+
     
     # Load and process TriviaQA
     if not args.truthfulqa_only:
@@ -359,9 +396,12 @@ def main():
         )
         all_samples.extend(triviaqa_samples)
         print(f"Added {len(triviaqa_samples)} TriviaQA samples")
+
     
-    # Add cross-contamination samples
-    if not args.no_cross_contamination and not args.truthfulqa_only and not args.triviaqa_only:
+    # Add cross-contamination samples only if both datasets are available
+    if (not args.no_cross_contamination and 
+        truthfulqa is not None and 
+        triviaqa is not None):
         cross_samples = create_cross_contamination_samples(
             truthfulqa, triviaqa,
             n_samples=100,
@@ -370,6 +410,7 @@ def main():
         )
         all_samples.extend(cross_samples)
         print(f"Added {len(cross_samples)} cross-contamination samples")
+
     
     # Shuffle all samples
     random.seed(args.seed)
@@ -382,11 +423,3 @@ def main():
     # Analyze and save
     analyze_dataset(all_samples)
     save_dataset(all_samples, args.output, args.include_metadata)
-    
-    print(f"\n✅ Enhanced dataset generation complete!")
-    print(f"📊 Total samples: {len(all_samples)}")
-    print(f"🎯 Ready for training with: python unified_experiments.py --data_path {args.output} --black_box --ensemble")
-
-
-if __name__ == "__main__":
-    main()
